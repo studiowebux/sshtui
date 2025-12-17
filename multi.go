@@ -69,7 +69,7 @@ func executeMultiHostLive(hosts []SSHHost, command string) {
 			args = append(args, command)
 			cmd := exec.Command("ssh", args...)
 
-			// Use PTY to handle passphrase prompts
+			// Use PTY for proper terminal handling
 			ptmx, err := pty.Start(cmd)
 			if err != nil {
 				outputMutex.Lock()
@@ -81,10 +81,7 @@ func executeMultiHostLive(hosts []SSHHost, command string) {
 			}
 			defer ptmx.Close()
 
-			// Copy stdin to PTY for passphrase (if needed)
-			go io.Copy(ptmx, os.Stdin)
-
-			// Collect output
+			// Collect output (stdin not needed for non-interactive commands)
 			var output bytes.Buffer
 			io.Copy(&output, ptmx)
 
@@ -124,7 +121,7 @@ func executeMultiHostCollected(hosts []SSHHost, command string) {
 			args = append(args, command)
 			cmd := exec.Command("ssh", args...)
 
-			// Use PTY to handle passphrase prompts
+			// Use PTY for proper terminal handling
 			ptmx, err := pty.Start(cmd)
 			if err != nil {
 				results[idx] = HostResult{
@@ -136,10 +133,7 @@ func executeMultiHostCollected(hosts []SSHHost, command string) {
 			}
 			defer ptmx.Close()
 
-			// Copy stdin to PTY for passphrase (if needed)
-			go io.Copy(ptmx, os.Stdin)
-
-			// Collect output
+			// Collect output (stdin not needed for non-interactive commands)
 			var output bytes.Buffer
 			io.Copy(&output, ptmx)
 

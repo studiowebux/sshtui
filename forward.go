@@ -41,6 +41,7 @@ func manageForwards(hosts []SSHHost) {
 
 		fmt.Println("\n\nActive Session Forwards:")
 		hasActiveForwards := false
+		sessionsMu.RLock()
 		for _, session := range sessions {
 			// Find the host for this session
 			for _, host := range hosts {
@@ -65,6 +66,7 @@ func manageForwards(hosts []SSHHost) {
 				}
 			}
 		}
+		sessionsMu.RUnlock()
 
 		if !hasActiveForwards {
 			fmt.Println("  No active forwards")

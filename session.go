@@ -6,10 +6,18 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sync"
 	"syscall"
 	"unsafe"
 
 	"github.com/creack/pty"
+)
+
+const (
+	ScrollbackReplaySize = 4096
+	MaxScrollbackSize    = 1024 * 1024
+	StdinBufSize         = 1024
+	PtyBufSize           = 4096
 )
 
 // Session represents a running SSH session with PTY
@@ -23,8 +31,9 @@ type Session struct {
 }
 
 var (
-	sessions []*Session
-	nextID   = 1
+	sessions   []*Session
+	nextID     = 1
+	sessionsMu sync.RWMutex
 )
 
 func createSession(host SSHHost) {
@@ -41,6 +50,7 @@ func createSession(host SSHHost) {
 		return
 	}
 
+	sessionsMu.Lock()
 	session := &Session{
 		ID:     nextID,
 		Alias:  host.Alias,
@@ -49,13 +59,15 @@ func createSession(host SSHHost) {
 		Active: true,
 	}
 	nextID++
-
 	sessions = append(sessions, session)
+	sessionsMu.Unlock()
 
 	// Monitor session
 	go func() {
 		cmd.Wait()
+		sessionsMu.Lock()
 		session.Active = false
+		sessionsMu.Unlock()
 	}()
 
 	// Attach immediately
@@ -63,6 +75,15 @@ func createSession(host SSHHost) {
 }
 
 func attachToSession(session *Session) {
+	// Panic recovery to ensure terminal is restored
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("\n\nPanic recovered: %v\n", r)
+			fmt.Println("Terminal state restored. Press Enter...")
+			bufio.NewReader(os.Stdin).ReadString('\n')
+		}
+	}()
+
 	if session.Cmd.ProcessState != nil && session.Cmd.ProcessState.Exited() {
 		fmt.Println("Session has ended. Press Enter...")
 		bufio.NewReader(os.Stdin).ReadString('\n')
@@ -80,8 +101,8 @@ func attachToSession(session *Session) {
 		scrollbackToShow := session.Scrollback
 
 		// Limit to last 4KB to avoid flooding terminal
-		if len(scrollbackToShow) > 4096 {
-			scrollbackToShow = scrollbackToShow[len(scrollbackToShow)-4096:]
+		if len(scrollbackToShow) > ScrollbackReplaySize {
+			scrollbackToShow = scrollbackToShow[len(scrollbackToShow)-ScrollbackReplaySize:]
 		}
 
 		// Write scrollback to stdout
@@ -94,17 +115,28 @@ func attachToSession(session *Session) {
 		pty.Setsize(session.PTY, ws)
 	}
 
-	// Handle window resize
+	// Handle window resize with proper cleanup
 	winch := make(chan os.Signal, 1)
 	signal.Notify(winch, syscall.SIGWINCH)
+	done := make(chan bool)
+
 	go func() {
-		for range winch {
-			if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
-				pty.Setsize(session.PTY, ws)
+		for {
+			select {
+			case <-winch:
+				if ws, err := pty.GetsizeFull(os.Stdin); err == nil {
+					pty.Setsize(session.PTY, ws)
+				}
+			case <-done:
+				return
 			}
 		}
 	}()
-	defer signal.Stop(winch)
+
+	defer func() {
+		signal.Stop(winch)
+		close(done)
+	}()
 
 	// Set raw mode
 	oldState, err := makeRaw(os.Stdin.Fd())
@@ -115,64 +147,77 @@ func attachToSession(session *Session) {
 	defer restore(os.Stdin.Fd(), oldState)
 
 	// I/O proxy
-	done := make(chan bool, 2)
+	ioStop := make(chan bool, 1)
 
 	// Stdin -> PTY
 	go func() {
-		buf := make([]byte, 1024)
+		buf := make([]byte, StdinBufSize)
 		for {
-			n, err := os.Stdin.Read(buf)
-			if err != nil {
-				done <- true
+			select {
+			case <-ioStop:
 				return
-			}
-
-			// Check for Ctrl+Space (ASCII 0)
-			for i := 0; i < n; i++ {
-				if buf[i] == 0 {
-					done <- true
+			default:
+				n, err := os.Stdin.Read(buf)
+				if err != nil {
+					ioStop <- true
 					return
 				}
-			}
 
-			_, err = session.PTY.Write(buf[:n])
-			if err != nil {
-				done <- true
-				return
+				// Check for Ctrl+Space (ASCII 0)
+				for i := 0; i < n; i++ {
+					if buf[i] == 0 {
+						ioStop <- true
+						return
+					}
+				}
+
+				_, err = session.PTY.Write(buf[:n])
+				if err != nil {
+					ioStop <- true
+					return
+				}
 			}
 		}
 	}()
 
 	// PTY -> Stdout (with capture to scrollback)
 	go func() {
-		buf := make([]byte, 4096)
+		buf := make([]byte, PtyBufSize)
 		for {
-			n, err := session.PTY.Read(buf)
-			if err != nil {
-				done <- true
+			select {
+			case <-ioStop:
 				return
-			}
-			if n > 0 {
-				// Write to stdout
-				os.Stdout.Write(buf[:n])
+			default:
+				n, err := session.PTY.Read(buf)
+				if err != nil {
+					ioStop <- true
+					return
+				}
+				if n > 0 {
+					// Write to stdout
+					os.Stdout.Write(buf[:n])
 
-				// Append to scrollback
-				session.Scrollback = append(session.Scrollback, buf[:n]...)
+					// Append to scrollback
+					session.Scrollback = append(session.Scrollback, buf[:n]...)
 
-				// Keep scrollback reasonable (last 1MB)
-				if len(session.Scrollback) > 1024*1024 {
-					session.Scrollback = session.Scrollback[len(session.Scrollback)-1024*1024:]
+					// Keep scrollback reasonable (last 1MB)
+					if len(session.Scrollback) > MaxScrollbackSize {
+						session.Scrollback = session.Scrollback[len(session.Scrollback)-MaxScrollbackSize:]
+					}
 				}
 			}
 		}
 	}()
 
 	// Wait for detach or end
-	<-done
+	<-ioStop
 
-	restore(os.Stdin.Fd(), oldState)
-	fmt.Print("\n\n[Detached - Press Enter]\n")
-	bufio.NewReader(os.Stdin).ReadString('\n')
+	// Give goroutines time to exit (they may be blocked on Read)
+	// Terminal state is restored by defer, so stdin becomes line-buffered again
+	// The user's Enter key press will be consumed by either:
+	// 1. The lingering goroutine (harmless), or
+	// 2. This ReadString (intended)
+	fmt.Print("\n\n[Detached]\n")
 }
 
 func makeRaw(fd uintptr) (*syscall.Termios, error) {
@@ -203,24 +248,32 @@ func restore(fd uintptr, state *syscall.Termios) error {
 }
 
 func closeAllSessions() {
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+
 	for _, s := range sessions {
-		if s.Cmd.Process != nil {
-			s.Cmd.Process.Kill()
-		}
 		if s.PTY != nil {
 			s.PTY.Close()
+		}
+		if s.Cmd.Process != nil {
+			s.Cmd.Process.Kill()
+			s.Cmd.Wait()
 		}
 	}
 }
 
 func closeActiveSession() {
+	sessionsMu.Lock()
+	defer sessionsMu.Unlock()
+
 	for i := len(sessions) - 1; i >= 0; i-- {
 		if sessions[i].Active {
-			if sessions[i].Cmd.Process != nil {
-				sessions[i].Cmd.Process.Kill()
-			}
 			if sessions[i].PTY != nil {
 				sessions[i].PTY.Close()
+			}
+			if sessions[i].Cmd.Process != nil {
+				sessions[i].Cmd.Process.Kill()
+				sessions[i].Cmd.Wait()
 			}
 			sessions = append(sessions[:i], sessions[i+1:]...)
 			break

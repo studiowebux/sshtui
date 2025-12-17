@@ -41,7 +41,12 @@ func main() {
 
 		// Read choice
 		reader := bufio.NewReader(os.Stdin)
-		input, _ := reader.ReadString('\n')
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\nError reading input: %v\n", err)
+			closeAllSessions()
+			break
+		}
 		input = strings.TrimSpace(input)
 
 		if input == "q" {
@@ -56,19 +61,35 @@ func main() {
 
 		if input == "v" {
 			// View scrollback
-			if len(sessions) > 0 {
+			sessionsMu.RLock()
+			hasSession := len(sessions) > 0
+			sessionsMu.RUnlock()
+
+			if hasSession {
 				fmt.Print("Which session? [!number]: ")
 				reader := bufio.NewReader(os.Stdin)
-				numStr, _ := reader.ReadString('\n')
+				numStr, err := reader.ReadString('\n')
+				if err != nil {
+					fmt.Printf("Error reading input: %v\n", err)
+					continue
+				}
 				numStr = strings.TrimSpace(numStr)
 				var num int
 				if strings.HasPrefix(numStr, "!") {
 					if _, err := fmt.Sscanf(numStr, "!%d", &num); err == nil {
+						sessionsMu.RLock()
 						if num > 0 && num <= len(sessions) {
-							viewScrollback(sessions[num-1])
+							session := sessions[num-1]
+							sessionsMu.RUnlock()
+							viewScrollback(session)
+						} else {
+							sessionsMu.RUnlock()
+							fmt.Println("Invalid session number")
 						}
 					}
 				}
+			} else {
+				fmt.Println("No active sessions")
 			}
 			continue
 		}
@@ -93,9 +114,21 @@ func main() {
 			// Resume session
 			var num int
 			if _, err := fmt.Sscanf(input, "!%d", &num); err == nil {
+				sessionsMu.RLock()
 				if num > 0 && num <= len(sessions) {
-					attachToSession(sessions[num-1])
+					session := sessions[num-1]
+					sessionsMu.RUnlock()
+					attachToSession(session)
+				} else {
+					sessionsMu.RUnlock()
+					fmt.Printf("Invalid session number: %d (have %d sessions)\n", num, len(sessions))
+					fmt.Println("Press Enter to continue...")
+					bufio.NewReader(os.Stdin).ReadString('\n')
 				}
+			} else {
+				fmt.Printf("Invalid format: %s (expected !number)\n", input)
+				fmt.Println("Press Enter to continue...")
+				bufio.NewReader(os.Stdin).ReadString('\n')
 			}
 			continue
 		}
@@ -105,7 +138,12 @@ func main() {
 		if _, err := fmt.Sscanf(input, "%d", &num); err == nil {
 			if num > 0 && num <= len(hosts) {
 				createSession(hosts[num-1])
+			} else {
+				fmt.Println("Invalid host number")
 			}
+		} else if input != "" {
+			fmt.Println("Invalid command. Press Enter to continue...")
+			bufio.NewReader(os.Stdin).ReadString('\n')
 		}
 	}
 }

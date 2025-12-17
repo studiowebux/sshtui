@@ -13,6 +13,7 @@ func showMenu(hosts []SSHHost) {
 	fmt.Println("║    sshtui - Session Manager            ║")
 	fmt.Println("╚════════════════════════════════════════╝\n")
 
+	sessionsMu.RLock()
 	if len(sessions) > 0 {
 		fmt.Println("Active Sessions:")
 		for i, s := range sessions {
@@ -24,6 +25,7 @@ func showMenu(hosts []SSHHost) {
 		}
 		fmt.Println()
 	}
+	sessionsMu.RUnlock()
 
 	fmt.Println("Connections:")
 	for i, host := range hosts {
@@ -91,9 +93,25 @@ func viewScrollback(session *Session) {
 
 		for i := currentLine; i < endLine; i++ {
 			line := lines[i]
-			// Highlight search term
+			// Highlight search term (case-insensitive)
 			if searchTerm != "" && strings.Contains(strings.ToLower(line), strings.ToLower(searchTerm)) {
-				line = strings.ReplaceAll(line, searchTerm, "\033[7m"+searchTerm+"\033[0m")
+				// Find and highlight all matches case-insensitively
+				lowerLine := strings.ToLower(line)
+				lowerTerm := strings.ToLower(searchTerm)
+				result := ""
+				pos := 0
+				for {
+					idx := strings.Index(lowerLine[pos:], lowerTerm)
+					if idx == -1 {
+						result += line[pos:]
+						break
+					}
+					idx += pos
+					result += line[pos:idx]
+					result += "\033[7m" + line[idx:idx+len(searchTerm)] + "\033[0m"
+					pos = idx + len(searchTerm)
+				}
+				line = result
 			}
 			fmt.Println(line)
 		}
