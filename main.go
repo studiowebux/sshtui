@@ -7,7 +7,27 @@ import (
 	"strings"
 )
 
+const version = "0.0.1"
+
 func main() {
+	// Handle CLI flags
+	if len(os.Args) > 1 {
+		arg := os.Args[1]
+		if arg == "--version" || arg == "-v" {
+			fmt.Printf("sshtui v%s\n", version)
+			os.Exit(0)
+		}
+		if arg == "--help" || arg == "-h" {
+			fmt.Println("sshtui - SSH session manager")
+			fmt.Printf("Version: %s\n\n", version)
+			fmt.Println("Usage: sshtui [options]")
+			fmt.Println("\nOptions:")
+			fmt.Println("  -v, --version    Show version")
+			fmt.Println("  -h, --help       Show help")
+			os.Exit(0)
+		}
+	}
+
 	// Parse SSH config
 	hosts, err := parseSSHConfig()
 	if err != nil {
