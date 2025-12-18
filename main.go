@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-const version = "0.0.2"
+const version = "0.0.3"
 
 func main() {
 	// Handle CLI flags
@@ -106,6 +106,20 @@ func main() {
 		if input == "f" {
 			// Port forward management
 			manageForwards(hosts)
+			continue
+		}
+
+		if input == "r" {
+			// Reload SSH config
+			newHosts, err := parseSSHConfig()
+			if err != nil {
+				fmt.Printf("Error reloading config: %v\nPress Enter...", err)
+				bufio.NewReader(os.Stdin).ReadString('\n')
+			} else {
+				hosts = newHosts
+				fmt.Printf("SSH config reloaded (%d hosts)\nPress Enter...", len(hosts))
+				bufio.NewReader(os.Stdin).ReadString('\n')
+			}
 			continue
 		}
 

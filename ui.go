@@ -46,6 +46,7 @@ func showMenu(hosts []SSHHost) {
 	fmt.Println("  v         - View scrollback/history")
 	fmt.Println("  m         - Multi-host command")
 	fmt.Println("  f         - Port forward info")
+	fmt.Println("  r         - Reload SSH config")
 	fmt.Println("  x         - Close active session")
 	fmt.Println("  q         - Quit all")
 	fmt.Println("\nIn session: Ctrl+Space to detach")

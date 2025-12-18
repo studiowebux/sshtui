@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 )
@@ -17,6 +19,7 @@ const (
 	MaxScrollbackSize    = 1024 * 1024
 	StdinBufSize         = 1024
 	PtyBufSize           = 4096
+	ConnectionTimeout    = 10 * time.Second
 )
 
 // Session represents a running SSH session with PTY
@@ -41,8 +44,39 @@ func createSession(host SSHHost) {
 	args := buildSSHArgs(host)
 	cmd := exec.Command("ssh", args...)
 
-	// Start with PTY
-	ptmx, err := pty.Start(cmd)
+	// Create context with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), ConnectionTimeout)
+	defer cancel()
+
+	// Start with PTY in goroutine to support timeout
+	type ptyResult struct {
+		ptmx *os.File
+		err  error
+	}
+	resultCh := make(chan ptyResult, 1)
+
+	go func() {
+		ptmx, err := pty.Start(cmd)
+		resultCh <- ptyResult{ptmx: ptmx, err: err}
+	}()
+
+	// Wait for connection or timeout
+	var ptmx *os.File
+	var err error
+	select {
+	case result := <-resultCh:
+		ptmx = result.ptmx
+		err = result.err
+	case <-ctx.Done():
+		// Timeout occurred
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		fmt.Printf("Connection timeout after %v\nPress Enter...", ConnectionTimeout)
+		bufio.NewReader(os.Stdin).ReadString('\n')
+		return
+	}
+
 	if err != nil {
 		fmt.Printf("Error: %v\nPress Enter...", err)
 		bufio.NewReader(os.Stdin).ReadString('\n')
@@ -146,35 +180,39 @@ func attachToSession(session *Session) {
 	defer restore(os.Stdin.Fd(), oldState)
 
 	// I/O proxy
-	ioStop := make(chan bool, 1)
+	ioStop := make(chan bool, 2) // Buffered to avoid blocking goroutines
 
 	// Stdin -> PTY
 	go func() {
 		buf := make([]byte, StdinBufSize)
 		for {
-			select {
-			case <-ioStop:
+			n, err := os.Stdin.Read(buf)
+			if err != nil {
+				select {
+				case ioStop <- true:
+				default:
+				}
 				return
-			default:
-				n, err := os.Stdin.Read(buf)
-				if err != nil {
-					ioStop <- true
-					return
-				}
+			}
 
-				// Check for Ctrl+Space (ASCII 0)
-				for i := 0; i < n; i++ {
-					if buf[i] == 0 {
-						ioStop <- true
-						return
+			// Check for Ctrl+Space (ASCII 0)
+			for i := 0; i < n; i++ {
+				if buf[i] == 0 {
+					select {
+					case ioStop <- true:
+					default:
 					}
-				}
-
-				_, err = session.PTY.Write(buf[:n])
-				if err != nil {
-					ioStop <- true
 					return
 				}
+			}
+
+			_, err = session.PTY.Write(buf[:n])
+			if err != nil {
+				select {
+				case ioStop <- true:
+				default:
+				}
+				return
 			}
 		}
 	}()
@@ -183,26 +221,24 @@ func attachToSession(session *Session) {
 	go func() {
 		buf := make([]byte, PtyBufSize)
 		for {
-			select {
-			case <-ioStop:
-				return
-			default:
-				n, err := session.PTY.Read(buf)
-				if err != nil {
-					ioStop <- true
-					return
+			n, err := session.PTY.Read(buf)
+			if err != nil {
+				select {
+				case ioStop <- true:
+				default:
 				}
-				if n > 0 {
-					// Write to stdout
-					os.Stdout.Write(buf[:n])
+				return
+			}
+			if n > 0 {
+				// Write to stdout
+				os.Stdout.Write(buf[:n])
 
-					// Append to scrollback
-					session.Scrollback = append(session.Scrollback, buf[:n]...)
+				// Append to scrollback
+				session.Scrollback = append(session.Scrollback, buf[:n]...)
 
-					// Keep scrollback reasonable (last 1MB)
-					if len(session.Scrollback) > MaxScrollbackSize {
-						session.Scrollback = session.Scrollback[len(session.Scrollback)-MaxScrollbackSize:]
-					}
+				// Keep scrollback reasonable (last 1MB)
+				if len(session.Scrollback) > MaxScrollbackSize {
+					session.Scrollback = session.Scrollback[len(session.Scrollback)-MaxScrollbackSize:]
 				}
 			}
 		}
@@ -211,15 +247,40 @@ func attachToSession(session *Session) {
 	// Wait for detach or end
 	<-ioStop
 
-	// Give goroutines time to exit (they may be blocked on Read)
-	// Terminal state is restored by defer, so stdin becomes line-buffered again
-	// The user's Enter key press will be consumed by either:
-	// 1. The lingering goroutine (harmless), or
-	// 2. This ReadString (intended)
+	// Don't close the channel - goroutines might still try to send to it
+	// Just let them finish naturally or remain blocked on Read()
+
+	// Note: Goroutines may still be blocked on Read() calls.
+	// Terminal restoration via defer will make stdin line-buffered again.
+	// The drainStdin call below will consume any pending input.
+
+	// Drain any pending stdin input that may have accumulated
+	// This prevents the need for double Enter after detach
+	drainStdin()
+
 	fmt.Print("\n\n[Detached]\n")
 }
 
 // makeRaw and restore are in terminal_darwin.go and terminal_linux.go
+
+// drainStdin consumes any pending input from stdin in non-blocking mode
+func drainStdin() {
+	// Set stdin to non-blocking mode temporarily
+	fd := int(os.Stdin.Fd())
+	if err := syscall.SetNonblock(fd, true); err != nil {
+		return
+	}
+	defer syscall.SetNonblock(fd, false)
+
+	// Drain all available data
+	buf := make([]byte, 1024)
+	for {
+		_, err := os.Stdin.Read(buf)
+		if err != nil {
+			break
+		}
+	}
+}
 
 func closeAllSessions() {
 	sessionsMu.Lock()
